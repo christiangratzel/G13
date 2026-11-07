@@ -47,7 +47,7 @@ struct KeyAction: Codable, Equatable {
         }
 
         guard let keycode = KeyMapper.macKeycodes[mainKey!] else {
-            print("[KeyMapper] Unknown key: '\(mainKey!)'")
+            //print("[KeyMapper] Unknown key: '\(mainKey!)'")
             return nil
         }
 
@@ -89,11 +89,16 @@ class KeyMapper: ObservableObject {
     private var pressedModifierKeycodes: Set<UInt16> = []
 
     private var accessibilityTimer: Timer?
+    private let mouseModifierBridge = MouseModifierBridge()
 
     func checkAccessibility() {
         hasAccessibility = AXIsProcessTrusted()
+        //print("[G13 Mouse] checkAccessibility: \(hasAccessibility)")
+        if hasAccessibility {
+            mouseModifierBridge.start()
+        }
         if !hasAccessibility {
-            print("[KeyMapper] Accessibility permission required")
+            //print("[KeyMapper] Accessibility permission required")
             let options = [kAXTrustedCheckOptionPrompt.takeRetainedValue(): true] as CFDictionary
             AXIsProcessTrustedWithOptions(options)
             startAccessibilityPolling()
@@ -109,7 +114,8 @@ class KeyMapper: ObservableObject {
                 DispatchQueue.main.async {
                     self.hasAccessibility = trusted
                     if trusted {
-                        print("[KeyMapper] Accessibility permission granted")
+                        //print("[KeyMapper] Accessibility permission granted")
+                        self.mouseModifierBridge.start()
                         timer.invalidate()
                         self.accessibilityTimer = nil
                     }
@@ -120,6 +126,8 @@ class KeyMapper: ObservableObject {
 
     // Handle a G13 key press/release. If the key has no mapping, it is ignored.
     func handleKey(name: String, isPressed: Bool, mapping: [String: KeyAction]) {
+        //print("[G13 DEBUG] handleKey: \(name), pressed: \(isPressed)")
+
         guard hasAccessibility else { return }
         guard let action = mapping[name] else { return }
 
@@ -209,17 +217,25 @@ class KeyMapper: ObservableObject {
             pressedModifierKeycodes.remove(keycode)
         }
 
-        guard let event = CGEvent(
-            keyboardEventSource: nil,
-            virtualKey: CGKeyCode(keycode),
-            keyDown: keyDown
-        ) else { return }
+        // The mouse tap cannot infer synthetic modifier state from macOS.
+        // Pass the G13-held modifiers to the tap explicitly.
+        mouseModifierBridge.setHeldFlags(heldModifierFlags)
+
+        // Use the combined session event source for synthetic modifiers.
+        guard let source = CGEventSource(stateID: .combinedSessionState),
+              let event = CGEvent(
+                  keyboardEventSource: source,
+                  virtualKey: CGKeyCode(keycode),
+                  keyDown: keyDown
+              ) else { return }
 
         // macOS represents modifier state changes as flagsChanged events,
         // not ordinary keyDown/keyUp events.
         event.type = .flagsChanged
         event.flags = heldModifierFlags
         event.post(tap: .cghidEventTap)
+
+        // print("[G13] Modifier \(keyDown ? "down" : "up"), flags=\(heldModifierFlags.rawValue)")
     }
 
     // MARK: - macOS keycodes
@@ -253,4 +269,93 @@ class KeyMapper: ObservableObject {
         "HOME": 0x73, "END": 0x77,
         "PAGEUP": 0x74, "PAGEDOWN": 0x79,
     ]
+}
+
+
+// MARK: - MouseModifierBridge
+// A session event tap supplements physical mouse clicks with G13-held modifiers.
+// Does NOT synthesize a second click. It leaves mouse events unchanged when
+// no G13 modifier is held. This is experimental: test in Finder before WoW.
+private final class MouseModifierBridge {
+    private let lock = NSLock()
+    private var g13Flags: CGEventFlags = []
+    private var eventTap: CFMachPort?
+    private var runLoopSource: CFRunLoopSource?
+
+    func setHeldFlags(_ flags: CGEventFlags) {
+        lock.lock()
+        g13Flags = flags
+        lock.unlock()
+    }
+
+    private func heldFlags() -> CGEventFlags {
+        lock.lock()
+        defer { lock.unlock() }
+        return g13Flags
+    }
+
+    func start() {
+        guard eventTap == nil else { return }
+        let eventTypes: [CGEventType] = [
+            .leftMouseDown, .leftMouseUp,
+            .rightMouseDown, .rightMouseUp,
+            .otherMouseDown, .otherMouseUp
+        ]
+        let mask = eventTypes.reduce(CGEventMask(0)) { mask, type in
+            mask | (CGEventMask(1) << type.rawValue)
+        }
+
+        let callback: CGEventTapCallBack = { proxy, type, event, userInfo in
+            guard let userInfo else { return Unmanaged.passUnretained(event) }
+            let bridge = Unmanaged<MouseModifierBridge>.fromOpaque(userInfo)
+                .takeUnretainedValue()
+
+            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                if let tap = bridge.eventTap {
+                    CGEvent.tapEnable(tap: tap, enable: true)
+                }
+                return Unmanaged.passUnretained(event)
+            }
+
+            let extra = bridge.heldFlags()
+            if extra.rawValue != 0 {
+                event.flags = event.flags.union(extra)
+                // Enable for diagnostic runs, if needed:
+                // print("[G13 Mouse] type=\(type.rawValue), flags=\(event.flags.rawValue)")
+            }
+            return Unmanaged.passUnretained(event)
+        }
+
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: mask,
+            callback: callback,
+            userInfo: Unmanaged.passUnretained(self).toOpaque()
+        ) else {
+            //print("[G13 Mouse] Could not create event tap; check Accessibility/Input Monitoring permissions")
+            return
+        }
+
+        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        eventTap = tap
+        runLoopSource = source
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+        //print("[G13 Mouse] Mouse modifier bridge active")
+    }
+
+    func stop() {
+        if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: false) }
+        if let source = runLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+        }
+        if let tap = eventTap { CFMachPortInvalidate(tap) }
+        runLoopSource = nil
+        eventTap = nil
+        setHeldFlags([])
+    }
+
+    deinit { stop() }
 }
